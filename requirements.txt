@@ -1,0 +1,22 @@
+# jostocks - a PyQt6 desktop view over the stocks scan pipeline.
+#
+#     python -m pip install -r requirements.txt
+#
+# The app's own dependencies are the first three. The rest are what the
+# pipeline already needs, listed because jostocks imports its modules
+# directly - position_sizer for the live sizing, rmt_cluster for the
+# correlation matrix, stock_evaluator for scoring a single ticker - and those
+# imports pull in the pipeline's own stack. If the pipeline already runs on
+# this machine, they are installed.
+
+# ── the app ──────────────────────────────────────────────────────────────
+PyQt6>=6.6
+PyQt6-WebEngine>=6.6     # the chart panels; everything else works without it
+plotly>=5.18             # also supplies the bundled plotly.js, so no CDN
+
+# ── what the pipeline needs ──────────────────────────────────────────────
+pandas>=2.0
+numpy>=1.24
+yfinance>=0.2.40
+curl_cffi>=0.6           # the impersonating HTTP session market_data prefers
+requests>=2.31
