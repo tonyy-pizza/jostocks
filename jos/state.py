@@ -27,8 +27,8 @@ import time
 from pathlib import Path
 
 from . import pipeline as pipe
-from .paths import (APP_DATA_DIR, HISTORY_DIR, NOTES_PATH, SETTINGS_PATH,
-                    STATUS_PATH, ensure_app_dirs)
+from .paths import (APP_DATA_DIR, HISTORY_DIR, HOLDINGS_SCORED_PATH,
+                    NOTES_PATH, SETTINGS_PATH, STATUS_PATH, ensure_app_dirs)
 
 # ─── DEFAULT SETTINGS ────────────────────────────────────────────────────
 # The keys section 9 and section 10 name, with the brief's own defaults, plus
@@ -360,6 +360,32 @@ def latest_snapshot(directory=None):
     return None, None
 
 
+def previous_snapshot(generated_at, directory=None):
+    """The newest snapshot that is NOT the scan identified by `generated_at`.
+
+    "Changes since last scan" means the scan before this one, and the app
+    files a snapshot of every scan it loads - so by the time the view is
+    drawn a second time, the newest snapshot IS the scan on screen and
+    comparing against it shows nothing changed. This skips it.
+
+    Matching on generated_at rather than on the file name because a snapshot
+    is named after the scan's own timestamp, and two scans a minute apart
+    round to the same minute in the name.
+    """
+    root = Path(directory or HISTORY_DIR)
+    if not root.is_dir():
+        return None, None
+    for path in sorted((p for p in root.glob("*.json") if p.is_file()),
+                       reverse=True):
+        document = read_json(path)
+        if not isinstance(document, dict):
+            continue
+        if generated_at and document.get("generated_at") == generated_at:
+            continue
+        return path, document
+    return None, None
+
+
 def snapshot_taken(generated_at, directory=None) -> bool:
     """Whether this scan has already been filed."""
     root = Path(directory or HISTORY_DIR)
@@ -444,6 +470,79 @@ def snapshot_nearest(days_ago, directory=None):
     if best is None:
         return None, None
     return best, read_json(best)
+
+
+def oldest_snapshot(directory=None):
+    """(path, parsed document) of the earliest snapshot, or (None, None)."""
+    root = Path(directory or HISTORY_DIR)
+    if not root.is_dir():
+        return None, None
+    for path in sorted(root.glob("*.json")):
+        document = read_json(path)
+        if isinstance(document, dict):
+            return path, document
+    return None, None
+
+
+def history_days(directory=None):
+    """How many days of history exist, or None when there are none.
+
+    Measured from the OLDEST snapshot to now, because that is what decides
+    whether a monthly comparison is possible at all. Holdings health reads
+    this to tell "the score is flat" apart from "there is nothing to compare
+    against yet", which look identical in a table and mean opposite things.
+    """
+    root = Path(directory or HISTORY_DIR)
+    if not root.is_dir():
+        return None
+
+    stamps = []
+    for path in root.glob("*.json"):
+        try:
+            stamps.append(dt.datetime.strptime(path.stem, SNAPSHOT_FORMAT))
+        except ValueError:
+            continue
+    if not stamps:
+        return None
+    return (dt.datetime.now() - min(stamps)).total_seconds() / 86400.0
+
+
+# ─── RE-SCORED HOLDINGS ──────────────────────────────────────────────────
+# Section 8 names holdings_scored.json as app-owned state. It is a cache of
+# the evaluator's own single-ticker output for each holding, so the health
+# view can draw a status without re-running the network on every launch.
+
+def read_holdings_scored(path=None) -> dict:
+    """{ticker: record} from the cache, or {}."""
+    document = read_json(path or HOLDINGS_SCORED_PATH)
+    if not isinstance(document, dict):
+        return {}
+    records = document.get("records")
+    return records if isinstance(records, dict) else {}
+
+
+def holdings_scored_age(path=None):
+    """Seconds since the holdings cache was written, or None."""
+    document = read_json(path or HOLDINGS_SCORED_PATH)
+    if not isinstance(document, dict):
+        return None
+    stamp = document.get("generated_at")
+    if not stamp:
+        return None
+    try:
+        written = dt.datetime.fromisoformat(str(stamp)[:19])
+    except ValueError:
+        return None
+    return max(0.0, (dt.datetime.now() - written).total_seconds())
+
+
+def write_holdings_scored(records, path=None) -> bool:
+    """Cache the re-scored holdings."""
+    return write_json({
+        "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "count": len(records or {}),
+        "records": records or {},
+    }, path or HOLDINGS_SCORED_PATH)
 
 
 def init() -> None:

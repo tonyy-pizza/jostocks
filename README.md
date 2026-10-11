@@ -106,10 +106,16 @@ to describe about itself.
   same source: `liq` from `liquidity_flag`, `trend` from `roa_trend`,
   `pattern` from the conviction verdict (the divergence pattern crossed with
   sentiment), `sent` from `sentiment.json`.
-- **changes since last scan** — Phase 2.
+- **changes since last scan** — what moved against the previous history
+  snapshot, as `new` / `up` / `down` / `dropped` rows with the score before and
+  after, the delta, and a reason read from a field that actually changed:
+  "pattern is now disconnect", "trend now failing", "failed the liquidity
+  filter", "fell below the minimum composite". Filter chips carry their counts.
+  A name whose composite moved by less than 0.05 is not a row — that is inside
+  the composite's own resolution and a table of forty such names is a table
+  nobody reads. With no earlier snapshot it says so in a sentence.
 - **popular & movers** — Phase 3.
-- **holdings & health** — your positions with the pipeline's own exit-review
-  verdict (see below).
+- **holdings & health** — your positions with a monthly health read (below).
 
 ### correlation (dropdown, web view)
 
@@ -141,12 +147,47 @@ be trusted.
 
 ### sector ratings
 
-Phase 2.
+One row per sector, best average first: the average on the chosen basis, how
+many names, how many of them you hold, and the best ticker. Clicking a sector
+filters the candidates table to it, switches the ratings dropdown to
+**candidates** so you can see the filter you just applied, and shows a
+`filtered: <sector>` chip; clicking the same sector again clears it. This panel
+needs no new data — it is an aggregate of what the scan already wrote.
+
+The basis toggle is **built from the data**, not hardcoded. The brief asks for
+"composite / valuation / quality" and adds: check what keys actually exist and
+only offer what the data supports. Checking is the operative word — the
+evaluator writes exactly six dimensions (Valuation, Profitability, Growth,
+Health, Momentum, Frameworks) and there is **no "quality"**. The nearest things
+to it are Profitability and Health, which measure different claims; collapsing
+them into one invented number would be this app asserting something the
+evaluator does not. So the toggle offers composite plus whichever of the six
+are actually present, discovered per scan. A scoring change that adds or
+renames a dimension shows up here on its own.
+
+Averages skip names with nothing to average rather than scoring them zero, and
+each row's tooltip says how many of its names were measured.
 
 ### ticker detail
 
-Always exactly one ticker, the subject. In Phase 1 the subject arrives by
-selection; the lookup box that scores any symbol on demand is Phase 2.
+Always exactly one ticker, the subject, which arrives one of two ways.
+
+**By selection** — a row in the ratings table, changes, or holdings. The source
+line reads "selected in candidates".
+
+**By lookup** — the box at the top takes any symbol. A name already in the scan
+appears immediately with no network at all, and the source line reads "in
+pipeline — scored 2h ago". Anything else is scored on demand through
+`score_candidate`, the same single-ticker path the evaluator's batch mode uses,
+off the UI thread with a visible progress state; the source line then reads
+"looked up — evaluated just now". A bare Canadian symbol is tried against
+`.TO`, `.V`, `.CN` and `.NE`, and if several listings return price history you
+are **asked which one** rather than having one picked for you — a bare "SHOP"
+is the US line or Toronto, and the two are different companies' worth of
+different. An unknown symbol gets a plain sentence. A looked-up ticker that is
+not in the scan has no sizing or correlation data, and those lines say "not in
+the current scan" instead of computing something. Recent subjects sit in a chip
+row under the box, kept in `settings.json`.
 
 Left: name, sector, currency, venue, composite, the dimension bars, risk
 flags, and the sized guidance with the holding it correlates with most. The
@@ -158,6 +199,55 @@ Right: Piotroski, Altman Z, ROA trend, FCF-positive years and the divergence
 pattern (not the composite again — that is in the header), a 24-week price
 sparkline, and a free-text note with a revisit date. Notes save on a short
 debounce to `data/notes.json`, keyed by ticker, and work for any ticker.
+
+### holdings & health
+
+Columns: ticker (with its name, venue and currency), weight, cost basis, the
+score a month ago against the score now, status, the next report date, and why.
+
+Status comes from the section 10 thresholds, applied against the history
+snapshot closest to `health_lookback_days` (30) ago:
+
+| Status | Means |
+|---|---|
+| `review` | composite down `health_review_drop` (1.5) or more, or the trend turned failing, or debt turned rising, or the composite is now below `health_red_below` (5.0) |
+| `watch` | composite down `health_watch_drop` (0.7) to 1.5, or it crossed down out of green |
+| `intact` | none of the above fired |
+| `building history` | less than `health_min_history_days` (14) of history, so there is nothing to compare against |
+| `no data` | the evaluator could not score this holding |
+
+These are triage flags, not sell signals. The status tooltip gives the exact
+rule that fired, the whole rule set, and the pipeline's own verdict beside it.
+
+`no data` exists because the alternative was wrong: a holding the evaluator
+cannot score has no composite, so no rule can fire, and falling through to
+`intact` would claim the thesis still holds on no evidence at all. The
+evaluator takes the same care — `build_scores()` suppresses a composite below
+its coverage minimum rather than reporting the name as mediocre.
+
+**re-score** runs every holding through stage 1 again off the UI thread and
+caches the result to `data/holdings_scored.json`, so the column is not blank
+after a restart. It also fetches each holding's next report date.
+
+#### Two verdicts, and why both are here
+
+`position_sizer` already re-scores every holding on each run and writes its own
+verdict into `sized_candidates.json` as `holdings_review`. This view does not
+throw that away, because the two answer different questions:
+
+- **the pipeline's** compares against the most recent archived run — "has this
+  changed since the last scan"
+- **this view's** compares against a month ago — "has this drifted over a month"
+
+A holding losing 0.3 a week never trips the pipeline's 1.5-point drop between
+two consecutive runs, and is down 1.5 here. The status column is the monthly
+read, because that is what the panel is for; the pipeline's verdict is in the
+tooltip, named as such.
+
+The green threshold defaults to the evaluator's `COLOUR_GOOD` (6.25) rather
+than the brief's 7.5, which predates the v5.5 rescale and would call almost
+everything "crossed out of green". It stays overridable through
+`health_green_from`.
 
 ### portfolio fit (web view)
 
@@ -171,7 +261,9 @@ flagged rather than added up.
 
 ### calendar (dropdown)
 
-Phase 3.
+Phase 3. The earnings-date lookup behind holdings & health is already built
+(`jos/earnings.py`), so the two-week strip is a view over data the app can
+already fetch.
 
 ---
 
@@ -318,6 +410,8 @@ few milliseconds and a note saved on every keystroke would otherwise be lost.
 | `data/notes.json` | `{ticker: {text, revisit, saved_at}}` |
 | `data/history/` | dated copies of `sized_candidates.json` (`YYYY-MM-DD_HHMM.json`), taken only when a scan produced new data, pruned past 90 days |
 | `data/corr_matrix.json` | the cached correlation matrix, keyed on the ticker set plus the scan's `generated_at` |
+| `data/holdings_scored.json` | the re-scored holdings, so the health column survives a restart |
+| `data/earnings_cache.json` | next report dates, a week's TTL, `unknown` where Yahoo has none |
 | `data/status.json` | what the refresh is doing; written by the autorun, read by the chip |
 | `data/refresh.lock` | the one-scan-at-a-time lock |
 | `data/logs/autorun.log` | rotating; under `pythonw` there is no console, so this is the only record of what a logon run did |
@@ -371,18 +465,17 @@ a scale of **0.423** in the pipeline; the correlation part alone gives
 reads the stored `conviction_scale` back and multiplies it in, exactly as
 `size_candidate`'s `finalize()` does.
 
-### Holdings health
+### Holdings health: the Phase 1 caveat, resolved
 
-`position_sizer` already re-scores every holding on every run — its exit
-review — and writes the verdict into `sized_candidates.json` as
-`holdings_review`. So the **holdings & health** view shows the pipeline's own
-verdict and the sentence that produced it: `intact` (hold), `watch`,
-`review` (exit_review), or `no data`.
-
-That means Phase 2's holdings-health module, as the brief describes it, would
-be a *second* opinion on a question the pipeline already answers, with its own
-re-scoring step and its own thresholds for three states that have the same
-names. Worth settling before building it.
+Phase 1 flagged that `position_sizer` already re-scores every holding and
+wondered whether the brief's health module was a second opinion on a settled
+question. Reading the source settles it: it is not. The pipeline's baseline is
+`latest_archive_scores()` — the most recent archived run — so it reports
+run-to-run change. The brief's baseline is a month ago. A holding sliding 0.3
+a week never trips the pipeline's 1.5-point drop between consecutive runs and
+is down 1.5 over a month, so the two genuinely disagree on the names that
+matter most. Both are shown; see
+[holdings & health](#holdings--health) above.
 
 ---
 
@@ -433,6 +526,10 @@ Both free on Google Fonts (OFL):
 | "no data yet, scan running or not run" | nothing has written `sized_candidates.json`. Run `run_scan.bat`, or press refresh. |
 | The window never appears at logon | `data/logs/autorun.log` is the record. Under `pythonw` there is no console for a traceback to land in. |
 | Scores look lower than you remember | evaluator v5.5 rescaled the composite; green starts at 6.25 now. |
+| Changes since last scan says there is nothing to compare | only one scan has been snapshotted so far. It fills in after the next one. |
+| Every holding reads "building history" | `data/history/` is less than `health_min_history_days` deep. It resolves itself as snapshots accumulate. |
+| A holding reads "no data" | the evaluator returned no composite for it — usually it has left the scanned universe. Press re-score; it is never guessed at. |
+| A next report date is "unknown" | Yahoo has no date for that name. Section 10 decided never to guess one. |
 
 ```
 python jostocks.py --self-test
@@ -447,31 +544,41 @@ too:
 
 ```
 python tests/make_fixtures.py tests/fakedata   # fixtures, built through the real position_sizer
+python tests/make_history.py tests/fakedata    # backdated snapshots to compare against
 python tests/logic_tests.py                    # locks, freshness, venues, history, no-data paths
 python tests/drive_app.py                      # opens the window and exercises the interactions
+python tests/phase2_tests.py                   # sectors, changes, lookup, holdings health
 ```
 
 `make_fixtures.py` builds a data directory by calling the pipeline's own
 `size_candidate` and `resolve_cluster`, so the fixtures cannot drift from the
-real schemas. The other two run against it. On Windows, drop
-`QT_QPA_PLATFORM=offscreen` to watch the window do it.
+real schemas. `make_history.py` then writes backdated copies with drifted
+scores, which is what gives the changes view and the 30-day health comparison
+something real to work against — run it before `phase2_tests.py`. On Windows,
+drop `QT_QPA_PLATFORM=offscreen` to watch the window do it.
+
+The fixtures deliberately include awkward cases, because those are the ones
+that break things: a candidate whose only stored correlation is `NaN`, a
+holding the evaluator cannot score, a name that left the universe, and a
+holding that slides slowly enough to escape the pipeline's own exit review.
 
 ---
 
 ## What is in this phase
 
-**Phase 1 (this build).** Shell, theme, platform layer, data loading and
-watcher, sizing strip, candidates table, the correlation dropdown (heatmap,
-scatter, clusters), ticker detail, portfolio fit, holdings with the pipeline's
-verdicts, the status chip, `jostocks_autorun.py`, the installers, the
-launcher, this README. Notes and history snapshots are in too — notes because
-ticker detail wanted somewhere to put them, history because the autorun needed
-to file one.
+**Phase 1.** Shell, theme, platform layer, data loading and watcher, sizing
+strip, candidates table, the correlation dropdown (heatmap, scatter,
+clusters), ticker detail, portfolio fit, holdings, the status chip,
+`jostocks_autorun.py`, the installers, the launcher, this README. Notes and
+history snapshots came in early too — notes because ticker detail wanted
+somewhere to put them, history because the autorun needed to file one.
 
-**Phase 2.** Changes since last scan, sector ratings, the lookup box in ticker
-detail, and holdings health (see the note above before building it).
+**Phase 2 (this build).** Changes since last scan, sector ratings, the lookup
+box in ticker detail, and holdings health with its 30-day comparison. The
+earnings-date lookup the health column needs is built as well, behind the
+small interface section 10 asks for.
 
-**Phase 3.** Popular & movers, earnings dates, macro releases.
+**Phase 3.** Popular & movers, the two-week earnings strip, macro releases.
 
 **Phase 4.** macOS autostart and view-only mode.
 

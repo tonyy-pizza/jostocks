@@ -35,9 +35,11 @@ def run():
         print("\n== data loaded ==")
         check("scan loaded", win.scan is not None and win.scan.ok)
         n = len(win.scan.candidates)
-        check("13 candidates", n == 13, f"got {n}")
-        check("candidates table populated", win.candidates.model.rowCount() == 13)
-        check("holdings table populated", win.holdings.table.rowCount() == 3)
+        check("candidates loaded", n > 0, f"got {n}")
+        check("candidates table populated", win.candidates.model.rowCount() == n)
+        check("holdings table populated",
+              win.holdings.table.rowCount() == len(win.scan.holdings),
+              f"{win.holdings.table.rowCount()} vs {len(win.scan.holdings)}")
         check("freshness text set", bool(win.freshness.text()))
         check("status chip set", bool(win.status_chip.text()), win.status_chip.text())
         print(f"       chip: {win.status_chip.text()!r}")
@@ -140,11 +142,13 @@ def run():
         win.candidates.set_sector_filter("Technology")
         app.processEvents()
         shown = win.candidates.proxy.rowCount()
-        check("filter narrows the table", 0 < shown < 13, f"{shown} rows")
+        check("filter narrows the table", 0 < shown < len(win.scan.candidates),
+              f"{shown} rows")
         check("filter chip visible", win.candidates.sector_chip.isVisible())
         win.candidates.set_sector_filter(None)
         app.processEvents()
-        check("clearing restores all rows", win.candidates.proxy.rowCount() == 13)
+        check("clearing restores all rows",
+              win.candidates.proxy.rowCount() == len(win.scan.candidates))
 
         print("\n== sorting ==")
         from jos.views.candidates import COL_SCORE, TICKER_ROLE
@@ -179,7 +183,8 @@ def run():
         print(f"       {statuses}")
         check("every holding has a status", all(statuses))
         check("statuses come from the verdict vocabulary",
-              set(statuses) <= {"intact","watch","review","no data"}, str(set(statuses)))
+              set(statuses) <= {"intact","watch","review","no data",
+                                "building history"}, str(set(statuses)))
         check("mixed-currency warning shown", "mixed currency" in win.holdings.currency_note.text(),
               win.holdings.currency_note.text())
 

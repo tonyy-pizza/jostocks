@@ -494,7 +494,7 @@ def clusters_html(scan) -> str:
                       or "this scan found no correlation clusters")
         return f'<div class="note">{_escape(reason)}</div>'
 
-    out = [_CLUSTER_CSS]
+    out = [_cluster_css()]
 
     if (scan.clustered or {}).get("insufficient_data_for_clustering"):
         note = (scan.clustered or {}).get("note") or ""
@@ -589,32 +589,41 @@ def _escape(text) -> str:
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
-_CLUSTER_CSS = f"""<style>
-  .wrap {{ padding: 0; }}
-  body {{ overflow-y: auto !important; }}
-  .card {{
-    border: 1px solid {theme.PANEL_BORDER};
-    margin: 0 0 8px 0; padding: 8px 10px;
-    background: {theme.BG};
-  }}
-  .head {{ display: flex; align-items: baseline; gap: 8px;
-           margin-bottom: 6px; flex-wrap: wrap; }}
-  .res {{ font-size: 10px; border: 1px solid; padding: 1px 5px;
-          text-transform: lowercase; }}
-  .meta {{ color: {theme.MUTED}; font-size: 10px; }}
-  .rows {{ display: flex; flex-direction: column; }}
-  .row {{ display: grid; grid-template-columns: 78px 58px 48px 1fr;
-          gap: 6px; padding: 2px 0;
-          border-bottom: 1px solid {theme.ROW_LINE}; align-items: baseline; }}
-  .row.win {{ background: {theme.SELECTED}; }}
-  .tk {{ color: {theme.CREAM}; }}
-  .vn {{ color: {theme.FAINT}; font-size: 10px; }}
-  .sc {{ text-align: right; }}
-  .mk {{ color: {theme.AMBER}; font-size: 10px; }}
-  .why, .why2 {{ color: {theme.MUTED}; font-size: 10px; }}
-  .why {{ margin-top: 6px; }}
-  .etf {{ color: {theme.AMBER}; font-size: 11px; margin-top: 5px; }}
-  .note {{ color: {theme.MUTED}; padding: 12px 2px; }}
-  .warn {{ color: {theme.AMBER}; padding: 6px 2px; }}
-  .row, .tk, .sc {{ font-family: {theme.font_families()['mono']}; font-size: 11px; }}
-</style>"""
+def _cluster_css() -> str:
+    """The cards' stylesheet.
+
+    A function, not a module constant: it interpolates theme.font_families(),
+    which reaches into QFontDatabase and so needs a QApplication to exist.
+    Computing it at import time made importing this module - from a test, or
+    from anything that runs before the app is constructed - emit a Qt warning
+    and fall back to whatever font Qt guesses.
+    """
+    return f"""<style>
+      .wrap {{ padding: 0; }}
+      body {{ overflow-y: auto !important; }}
+      .card {{
+        border: 1px solid {theme.PANEL_BORDER};
+        margin: 0 0 8px 0; padding: 8px 10px;
+        background: {theme.BG};
+      }}
+      .head {{ display: flex; align-items: baseline; gap: 8px;
+               margin-bottom: 6px; flex-wrap: wrap; }}
+      .res {{ font-size: 10px; border: 1px solid; padding: 1px 5px;
+              text-transform: lowercase; }}
+      .meta {{ color: {theme.MUTED}; font-size: 10px; }}
+      .rows {{ display: flex; flex-direction: column; }}
+      .row {{ display: grid; grid-template-columns: 78px 58px 48px 1fr;
+              gap: 6px; padding: 2px 0;
+              border-bottom: 1px solid {theme.ROW_LINE}; align-items: baseline; }}
+      .row.win {{ background: {theme.SELECTED}; }}
+      .tk {{ color: {theme.CREAM}; }}
+      .vn {{ color: {theme.FAINT}; font-size: 10px; }}
+      .sc {{ text-align: right; }}
+      .mk {{ color: {theme.AMBER}; font-size: 10px; }}
+      .why, .why2 {{ color: {theme.MUTED}; font-size: 10px; }}
+      .why {{ margin-top: 6px; }}
+      .etf {{ color: {theme.AMBER}; font-size: 11px; margin-top: 5px; }}
+      .note {{ color: {theme.MUTED}; padding: 12px 2px; }}
+      .warn {{ color: {theme.AMBER}; padding: 6px 2px; }}
+      .row, .tk, .sc {{ font-family: {theme.font_families()['mono']}; font-size: 11px; }}
+    </style>"""

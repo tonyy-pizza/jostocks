@@ -1,71 +1,83 @@
-r"""jos/views/holdings.py - what is already owned.
+r"""jos/views/holdings.py - what is already owned, and whether it still holds.
 
-Phase 1's holdings view. The brief files it as "holdings view (without
-health)", on the assumption the app would have to re-score the holdings
-itself before it could say anything about their condition.
+Columns are section 6's: ticker (with its name and currency), weight, the
+score a month ago against the score now, status, the next report date, and
+why. Status comes from jos.health, which applies the section 10 thresholds
+against the history snapshot closest to `health_lookback_days` ago.
 
-It does not have to. position_sizer already re-scores every holding on every
-run - its exit review is the second half of the strategy, the part that asks
-whether a thesis has quietly stopped being true - and writes the result into
-sized_candidates.json as `holdings_review`. So the verdict column here is the
-pipeline's own: hold, watch, exit_review, or unavailable, with the sentence
-that produced it. Nothing is invented, and nothing is recomputed.
+TWO VERDICTS, AND WHY BOTH ARE HERE
+-----------------------------------
+position_sizer writes its own verdict into sized_candidates.json as
+`holdings_review`, and this view does not throw it away. The two answer
+different questions:
 
-What this means for Phase 2: the brief's holdings-health module wants its own
-re-scoring step into holdings_scored.json with its own review/watch/intact
-thresholds. That would be a second opinion on a question the pipeline already
-answers, with different words for the same three states. Worth settling before
-building it - noted in the README.
+    the pipeline's    compares against the most recent archived run, so it
+                      says "has this changed since the last scan"
+    this view's       compares against a month ago, so it says "has this
+                      drifted over a month"
 
-Currencies are never summed across (section 12). The weight column is a share
-of cost basis WITHIN each currency, and a mixed-currency portfolio gets a
-labelled warning rather than a single meaningless total.
+A holding losing 0.3 a week never trips the pipeline's 1.5-point drop between
+two consecutive runs, and is down 1.5 here. The status column is the monthly
+read, because that is the one the panel exists for; the pipeline's verdict is
+in the status tooltip, named as such.
+
+Currencies are never summed across (section 12). Weight is a share of cost
+basis WITHIN each currency, and a mixed portfolio is labelled instead of
+added up.
 """
 
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor
-from PyQt6.QtWidgets import (QHBoxLayout, QHeaderView, QLabel,
-                             QTableWidget, QTableWidgetItem, QVBoxLayout,
-                             QWidget)
+from PyQt6.QtWidgets import (QHBoxLayout, QHeaderView, QLabel, QTableWidget,
+                             QTableWidgetItem, QVBoxLayout, QWidget)
 
+from .. import earnings as earnings_module
+from .. import health as health_module
 from .. import pipeline as pipe
 from .. import theme
-from ..datastore import describe_age, age_seconds, venue
-from .panel import Message
+from ..datastore import describe_age, venue
+from .panel import Chip, Message
 
-COLUMNS = ("ticker", "venue", "shares", "cost basis", "weight",
-           "score", "since", "status", "why")
+COLUMNS = ("ticker", "weight", "cost basis", "score, 30d → now",
+           "status", "next report", "why")
 
-COL_TICKER, COL_VENUE, COL_SHARES, COL_BASIS, COL_WEIGHT, \
-    COL_SCORE, COL_SINCE, COL_STATUS, COL_WHY = range(9)
+COL_TICKER, COL_WEIGHT, COL_BASIS, COL_SCORE, COL_STATUS, \
+    COL_REPORT, COL_WHY = range(7)
 
-# The pipeline's verdicts, with the app's wording and colour. Its words are
-# kept as the tooltip so the two are never out of step.
-VERDICTS = {
-    "hold": ("intact", theme.GREEN,
-             "fundamentals still support the position"),
-    "watch": ("watch", theme.AMBER,
-              "worth a look: the score has slipped or two trend categories "
-              "are deteriorating"),
-    "exit_review": ("review", theme.RED,
-                    "an exit trigger fired - the score is at or below the "
-                    "exit band, the multi-year trend is deteriorating, or "
-                    "the composite fell sharply since the last archived scan"),
-    "unavailable": ("no data", theme.FAINT,
-                    "this holding could not be re-scored on the last run"),
+#: The app's own monthly verdicts, with their colour. The word carries the
+#: meaning; colour only reinforces it.
+STATUS_TINT = {
+    health_module.REVIEW: theme.RED,
+    health_module.WATCH: theme.AMBER,
+    health_module.INTACT: theme.GREEN,
+    health_module.BUILDING: theme.FAINT,
+    health_module.NO_DATA: theme.FAINT,
+}
+
+#: The pipeline's own exit-review verdicts, for the tooltip.
+PIPELINE_VERDICT = {
+    "hold": "fundamentals still support the position",
+    "watch": "worth a look",
+    "exit_review": "an exit trigger fired",
+    "unavailable": "could not be re-scored on the last run",
 }
 
 
 class HoldingsView(QWidget):
-    """A table of holdings with the pipeline's own exit-review verdict."""
+    """Holdings with a monthly health read."""
 
     selected = pyqtSignal(str)
+    rescore_requested = pyqtSignal()
 
-    def __init__(self, parent=None):
+    def __init__(self, settings=None, parent=None):
         super().__init__(parent)
         self._scan = None
+        self._settings = settings
+        self._rows = []
+        self._earnings = {}
+        self._rescored = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -77,9 +89,18 @@ class HoldingsView(QWidget):
         self.summary.setObjectName("caption")
         head.addWidget(self.summary)
         head.addStretch(1)
+
         self.currency_note = QLabel("")
         self.currency_note.setObjectName("caption")
         head.addWidget(self.currency_note)
+
+        self.rescore_chip = Chip("re-score")
+        self.rescore_chip.setToolTip(
+            "Run every holding through stage 1 again and fetch its next "
+            "report date. Uses the evaluator's own single-ticker path, off "
+            "the UI thread, cached to data/holdings_scored.json.")
+        self.rescore_chip.clicked.connect(self.rescore_requested.emit)
+        head.addWidget(self.rescore_chip)
         layout.addLayout(head)
 
         self.table = QTableWidget(0, len(COLUMNS))
@@ -95,10 +116,9 @@ class HoldingsView(QWidget):
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(COL_WHY, QHeaderView.ResizeMode.Stretch)
-        for column, width in ((COL_TICKER, 86), (COL_VENUE, 62),
-                              (COL_SHARES, 62), (COL_BASIS, 78),
-                              (COL_WEIGHT, 64), (COL_SCORE, 56),
-                              (COL_SINCE, 62), (COL_STATUS, 66)):
+        for column, width in ((COL_TICKER, 100), (COL_WEIGHT, 62),
+                              (COL_BASIS, 96), (COL_SCORE, 112),
+                              (COL_STATUS, 78), (COL_REPORT, 104)):
             self.table.setColumnWidth(column, width)
 
         self.table.itemSelectionChanged.connect(self._on_selection)
@@ -108,8 +128,29 @@ class HoldingsView(QWidget):
         self.message.hide()
         layout.addWidget(self.message)
 
-    def set_scan(self, scan):
+        self.footer = QLabel("")
+        self.footer.setObjectName("faint")
+        self.footer.setWordWrap(True)
+        layout.addWidget(self.footer)
+
+    # ── data in ─────────────────────────────────────────────────────
+    def set_rescored(self, records):
+        """Fresh stage-1 records from the re-score worker."""
+        self._rescored = dict(records or {})
+        self.set_scan(self._scan)
+
+    def set_earnings(self, dates):
+        """{ticker: {date, timing}} from the earnings worker."""
+        self._earnings = dict(dates or {})
+        self.set_scan(self._scan)
+
+    def set_scan(self, scan, history_days=None, baseline=None):
         self._scan = scan
+        if history_days is not None:
+            self._history_days = history_days
+        if baseline is not None:
+            self._baseline = baseline
+
         holdings = scan.holdings if scan else []
 
         if not holdings:
@@ -117,19 +158,44 @@ class HoldingsView(QWidget):
             self.table.hide()
             self.summary.setText("")
             self.currency_note.setText("")
+            self.footer.setText("")
+            self.rescore_chip.setEnabled(False)
             self.message.setText(
                 "no holdings on file. position_sizer writes a template to "
                 "holdings.json on its first run - fill it in with real "
                 "positions and the next scan will size candidates against "
                 "them. Until then, sizing is not correlation-adjusted, "
-                "which is the honest answer rather than a correlation of zero.")
+                "which is the honest answer rather than a correlation of "
+                "zero.")
             self.message.show()
             return
 
         self.message.hide()
         self.table.show()
+        self.rescore_chip.setEnabled(True)
 
-        # Share of cost basis within each currency - never across.
+        limits = health_module.thresholds(self._settings) if self._settings \
+            else health_module.thresholds(_Defaults())
+        history_days = getattr(self, "_history_days", None)
+        baseline = getattr(self, "_baseline", None) or {}
+
+        # Now: the fresh re-score where there is one, else the scan's own
+        # record for the name.
+        current = {}
+        for holding in holdings:
+            ticker = holding.get("ticker")
+            record = (self._rescored.get(ticker)
+                      or scan.scored_by_ticker.get(ticker)
+                      or scan.by_ticker.get(ticker)
+                      or scan.review_by_ticker.get(ticker)
+                      or {})
+            current[ticker] = record
+
+        self._rows = health_module.assess(
+            holdings, current, baseline, limits, history_days=history_days,
+            earnings=self._earnings)
+
+        # Weight within each currency, never across.
         totals = {}
         for holding in holdings:
             currency = scan.holding_currency(holding)
@@ -138,12 +204,15 @@ class HoldingsView(QWidget):
             totals[currency] = totals.get(currency, 0.0) + shares * basis
 
         self.table.setSortingEnabled(False)
-        self.table.setRowCount(len(holdings))
+        self.table.setRowCount(len(self._rows))
 
-        for row, holding in enumerate(holdings):
-            ticker = holding.get("ticker") or ""
+        rule_text = health_module.describe_rules(limits)
+
+        for index, row in enumerate(self._rows):
+            ticker = row["ticker"]
+            holding = row["holding"]
+            record = row["record"] or {}
             currency = scan.holding_currency(holding)
-            review = scan.review_by_ticker.get(ticker) or {}
 
             shares = pipe.num(holding.get("shares"))
             basis = pipe.num(holding.get("cost_basis"))
@@ -151,84 +220,123 @@ class HoldingsView(QWidget):
             total = totals.get(currency) or 0.0
             weight = (100.0 * value / total) if total > 0 else None
 
-            composite = pipe.num(review.get("composite"))
-            if composite is None:
-                candidate = scan.by_ticker.get(ticker) or {}
-                composite = pipe.num(candidate.get("composite"))
-            delta = pipe.num(review.get("composite_delta"))
+            before, after = row.get("before"), row.get("after")
+            if before is not None and after is not None:
+                score_text = f"{before:.2f} → {after:.2f}"
+            elif after is not None:
+                score_text = f"→ {after:.2f}"
+            else:
+                score_text = "n/a"
 
-            verdict = review.get("verdict") or ("unavailable" if not review
-                                                else "hold")
-            label, colour, tip = VERDICTS.get(
-                verdict, (str(verdict), theme.FAINT, ""))
+            status = row["status"]
+            tint = STATUS_TINT.get(status, theme.FAINT)
+            report = earnings_module.describe(row.get("next_report"))
+            why = "; ".join(str(r) for r in (row.get("reasons") or []))
 
-            reasons = review.get("reasons") or []
-            why = str(reasons[0]) if reasons else (
-                "no exit review on file for this holding" if not review else "")
+            name = record.get("name") or ""
+            label = f"{ticker}"
 
-            cells = [
-                (COL_TICKER, ticker, None, ticker),
-                (COL_VENUE, venue(ticker), theme.MUTED, venue(ticker)),
-                (COL_SHARES, "" if shares is None else f"{shares:g}",
-                 None, shares or 0),
-                (COL_BASIS, "" if basis is None else f"{basis:,.2f} {currency}",
-                 None, basis or 0),
+            cells = (
+                (COL_TICKER, label, None, ticker),
                 (COL_WEIGHT, "" if weight is None else f"{weight:.1f}%",
                  None, weight or 0),
-                (COL_SCORE, "n/a" if composite is None else f"{composite:.2f}",
-                 theme.score_colour(composite),
-                 -1e9 if composite is None else composite),
-                (COL_SINCE, "" if delta is None else f"{delta:+.2f}",
-                 (theme.RED if delta is not None and delta < 0
-                  else theme.GREEN if delta else theme.FAINT),
-                 delta if delta is not None else 0),
-                (COL_STATUS, label, colour, label),
+                (COL_BASIS, "" if basis is None else f"{basis:,.2f} {currency}",
+                 None, basis or 0),
+                (COL_SCORE, score_text, theme.score_colour(after),
+                 -1e9 if after is None else after),
+                (COL_STATUS, status, tint, status),
+                (COL_REPORT, report,
+                 theme.FAINT if report == earnings_module.UNKNOWN else None,
+                 str((row.get("next_report") or {}).get("date") or "zzzz")),
                 (COL_WHY, why, theme.MUTED, why),
-            ]
+            )
 
-            for column, text, colour_hex, sort_value in cells:
+            for column, text, colour, sort_value in cells:
                 item = QTableWidgetItem(str(text))
                 item.setData(Qt.ItemDataRole.UserRole, sort_value)
-                if colour_hex:
-                    item.setForeground(QColor(colour_hex))
-                if column == COL_STATUS:
-                    rule = tip
-                    if reasons:
-                        rule = tip + "\n\nthis holding: " + "; ".join(
-                            str(r) for r in reasons)
-                    item.setToolTip(rule)
-                elif column == COL_SINCE:
-                    previous = pipe.num(review.get("previous_composite"))
-                    item.setToolTip(
-                        "change since the most recent archived scan"
-                        + (f" (was {previous:.2f})" if previous is not None else ""))
-                elif column == COL_BASIS:
-                    item.setToolTip(
-                        f"average price per share, in {currency}. "
-                        f"Cost-basis totals are grouped by currency and "
-                        f"never summed across them.")
-                elif column == COL_WEIGHT:
-                    item.setToolTip(f"share of {currency} cost basis")
-                if column in (COL_SHARES, COL_BASIS, COL_WEIGHT, COL_SCORE,
-                              COL_SINCE):
+                if colour:
+                    item.setForeground(QColor(colour))
+                if column in (COL_WEIGHT, COL_BASIS, COL_SCORE):
                     item.setTextAlignment(int(Qt.AlignmentFlag.AlignRight
                                               | Qt.AlignmentFlag.AlignVCenter))
-                self.table.setItem(row, column, item)
+
+                if column == COL_TICKER:
+                    tip = [f"{ticker} · {venue(ticker)} · {currency}"]
+                    if name:
+                        tip.append(name)
+                    if shares is not None:
+                        tip.append(f"{shares:g} shares")
+                    if holding.get("entry_date"):
+                        tip.append(f"opened {holding['entry_date']}")
+                    if holding.get("entry_price") is not None:
+                        tip.append(f"entry {holding['entry_price']:,.2f}")
+                    item.setToolTip("\n".join(tip))
+
+                elif column == COL_STATUS:
+                    tip = [f"{status}: " + "; ".join(row.get("reasons") or [])]
+                    review = scan.review_by_ticker.get(ticker) or {}
+                    verdict = review.get("verdict")
+                    if verdict:
+                        reasons = "; ".join(str(r) for r in
+                                            (review.get("reasons") or []))
+                        tip.append(
+                            f"\nThe pipeline's own exit review, which "
+                            f"compares against the last archived scan rather "
+                            f"than a month ago, says “{verdict}”"
+                            + (f": {reasons}" if reasons else "")
+                            + f". {PIPELINE_VERDICT.get(verdict, '')}".rstrip())
+                    tip.append("\n" + rule_text)
+                    item.setToolTip("\n".join(tip))
+
+                elif column == COL_SCORE:
+                    delta = row.get("delta")
+                    tip = [f"composite now {after:.2f}" if after is not None
+                           else "no composite now"]
+                    if before is not None:
+                        tip.append(
+                            f"{before:.2f} in the snapshot nearest "
+                            f"{limits['lookback_days']:.0f} days ago")
+                    if delta is not None:
+                        tip.append(f"{delta:+.2f} over the window")
+                    item.setToolTip("\n".join(tip))
+
+                elif column == COL_WEIGHT:
+                    item.setToolTip(
+                        f"share of {currency} cost basis. Totals are grouped "
+                        f"by currency and never summed across them.")
+
+                elif column == COL_BASIS:
+                    item.setToolTip(
+                        f"average price per share, in {currency}")
+
+                elif column == COL_REPORT:
+                    entry = row.get("next_report") or {}
+                    if entry.get("date"):
+                        item.setToolTip(
+                            f"next report {entry['date']}"
+                            + (f", {entry['timing']}" if entry.get("timing")
+                               else ""))
+                    else:
+                        item.setToolTip(
+                            "Yahoo has no date for this name. Press re-score "
+                            "to look again; it is never guessed.")
+
+                self.table.setItem(index, column, item)
 
         self.table.setSortingEnabled(True)
+        self._render_summary(scan, holdings, limits, history_days)
 
+    def _render_summary(self, scan, holdings, limits, history_days):
         counts = {}
-        for holding in holdings:
-            review = scan.review_by_ticker.get(holding.get("ticker")) or {}
-            verdict = review.get("verdict") or "unavailable"
-            counts[verdict] = counts.get(verdict, 0) + 1
+        for row in self._rows:
+            counts[row["status"]] = counts.get(row["status"], 0) + 1
 
         parts = [f"{len(holdings)} holding(s)"]
-        for verdict in ("exit_review", "watch", "hold"):
-            if counts.get(verdict):
-                parts.append(f"{counts[verdict]} {VERDICTS[verdict][0]}")
-        age = scan.age
-        parts.append(f"reviewed {describe_age(age)}")
+        for status in (health_module.REVIEW, health_module.WATCH,
+                       health_module.INTACT, health_module.BUILDING,
+                       health_module.NO_DATA):
+            if counts.get(status):
+                parts.append(f"{counts[status]} {status}")
         self.summary.setText(" · ".join(parts))
 
         if scan.mixed_currency:
@@ -240,10 +348,44 @@ class HoldingsView(QWidget):
         else:
             self.currency_note.setText("")
 
+        bits = []
+        if history_days is None:
+            bits.append("no history yet, so no monthly comparison is possible")
+        elif history_days < limits["min_history_days"]:
+            bits.append(
+                f"history is {history_days:.0f} day(s) deep; a status needs "
+                f"{limits['min_history_days']:.0f}, so these read "
+                f"“{health_module.BUILDING}”")
+        else:
+            bits.append(f"compared against {history_days:.0f} day(s) of history")
+
+        if self._rescored:
+            bits.append(f"{len(self._rescored)} re-scored this session")
+        else:
+            bits.append(f"scores from the scan, {describe_age(scan.age)}")
+        self.footer.setText(" · ".join(bits))
+
     def _on_selection(self):
         rows = self.table.selectionModel().selectedRows()
         if not rows:
             return
         item = self.table.item(rows[0].row(), COL_TICKER)
-        if item is not None and item.text():
-            self.selected.emit(item.text())
+        if item is None:
+            return
+        ticker = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+        if ticker:
+            self.selected.emit(ticker)
+
+    def holding_tickers(self):
+        return [row["ticker"] for row in self._rows]
+
+
+class _Defaults:
+    """Stand-in settings, so the view works before one is handed over."""
+
+    def get(self, key, default=None):
+        from ..state import DEFAULTS
+        return DEFAULTS.get(key, default)
+
+    def green_from(self):
+        return pipe.colour_thresholds()[0]

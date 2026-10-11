@@ -98,6 +98,54 @@ def _self_test() -> int:
         problems = sizing_module.verify(scan.candidates, scan.params)
         print(f"  sizing check:    "
               f"{'matches the scan' if not problems else f'{len(problems)} MISMATCH(ES)'}")
+        # ── Phase 2 state ───────────────────────────────────────
+        from jos import changes as changes_module
+        from jos import health as health_module
+        from jos import sectors as sectors_module
+
+        depth = state_module.history_days()
+        limits = health_module.thresholds(settings)
+        print(f"  history:         "
+              f"{'none yet' if depth is None else f'{depth:.0f} day(s) deep'}"
+              f" (need {limits['min_history_days']:.0f} for a health verdict)")
+
+        _path, previous = state_module.previous_snapshot(scan.generated_at)
+        diff = changes_module.compare(scan.sized, previous,
+                                      scored=scan.scored)
+        if diff.get("available"):
+            counts = diff["counts"]
+            print(f"  changes:         "
+                  f"{counts['new']} new, {counts['up']} up, "
+                  f"{counts['down']} down, {counts['dropped']} dropped")
+        else:
+            print(f"  changes:         {diff.get('reason')}")
+
+        bases = [k for k, _ in sectors_module.available_bases(scan.candidates)]
+        print(f"  sector bases:    {', '.join(bases)}")
+
+        if scan.holdings:
+            _path, baseline = state_module.snapshot_nearest(
+                limits["lookback_days"])
+            rows = health_module.assess(
+                scan.holdings,
+                {h["ticker"]: (scan.scored_by_ticker.get(h["ticker"])
+                               or scan.by_ticker.get(h["ticker"])
+                               or scan.review_by_ticker.get(h["ticker"]) or {})
+                 for h in scan.holdings},
+                health_module.baseline_from(baseline), limits,
+                history_days=depth)
+            tally = {}
+            for row in rows:
+                tally[row["status"]] = tally.get(row["status"], 0) + 1
+            print("  holdings health: "
+                  + ", ".join(f"{n} {s}" for s, n in sorted(tally.items())))
+
+        cached = state_module.read_holdings_scored()
+        age = state_module.holdings_scored_age()
+        print(f"  re-scored cache: "
+              + (f"{len(cached)} holding(s), written "
+                 f"{int(age // 3600)}h ago" if cached else "empty"))
+
     else:
         print(f"  candidates:      none - {scan.empty_reason}")
 

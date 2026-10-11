@@ -180,6 +180,7 @@ class TickerDetail(QWidget):
     watch_requested = pyqtSignal(str)
     reevaluate_requested = pyqtSignal(str)
     note_changed = pyqtSignal(str, str, str)        # ticker, text, revisit
+    lookup_requested = pyqtSignal(str)              # a symbol to resolve/score
 
     def __init__(self, notes=None, parent=None):
         super().__init__(parent)
@@ -187,6 +188,9 @@ class TickerDetail(QWidget):
         self._subject = None
         self._scan = None
         self._sizing = {}
+        # Records for tickers that are not in the scan, scored on demand by
+        # the lookup box. Keyed by ticker; the subject may be one of these.
+        self._external = {}
 
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -196,6 +200,44 @@ class TickerDetail(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(6)
+
+        # ── lookup: any symbol becomes the subject ──────────────────
+        # At the top of the panel, because it is the way in that does not
+        # depend on the ticker already being in the scan.
+        lookup = QHBoxLayout()
+        lookup.setSpacing(6)
+
+        self.lookup_box = QLineEdit()
+        self.lookup_box.setPlaceholderText("look up any symbol")
+        self.lookup_box.setMaximumWidth(170)
+        self.lookup_box.setToolTip(
+            "Any symbol. A name already in the scan shows immediately; "
+            "anything else is scored on demand through the same single-ticker "
+            "path the evaluator's batch mode uses.\n\n"
+            "A bare Canadian symbol is tried against .TO, .V, .CN and .NE, "
+            "and you are asked which listing you meant.")
+        self.lookup_box.returnPressed.connect(self._on_lookup)
+        lookup.addWidget(self.lookup_box)
+
+        self.lookup_button = Chip("look up")
+        self.lookup_button.clicked.connect(self._on_lookup)
+        lookup.addWidget(self.lookup_button)
+
+        self.lookup_state = QLabel("")
+        self.lookup_state.setObjectName("faint")
+        self.lookup_state.setWordWrap(True)
+        lookup.addWidget(self.lookup_state, 1)
+
+        outer.addLayout(lookup)
+
+        # Resolved listings to choose between, and recent subjects to reopen.
+        self._choice_row = QHBoxLayout()
+        self._choice_row.setSpacing(4)
+        outer.addLayout(self._choice_row)
+
+        self._recent_row = QHBoxLayout()
+        self._recent_row.setSpacing(4)
+        outer.addLayout(self._recent_row)
 
         # ── header: subject, source, buttons ────────────────────────
         head = QHBoxLayout()
@@ -360,6 +402,87 @@ class TickerDetail(QWidget):
 
         return holder
 
+    # ── lookup ──────────────────────────────────────────────────────
+    def _on_lookup(self):
+        """Enter, or the look-up button."""
+        symbol = self.lookup_box.text().strip().upper()
+        if not symbol:
+            return
+        self._clear_choices()
+        self.lookup_requested.emit(symbol)
+
+    def set_lookup_state(self, text, level="faint"):
+        """The one-line state beside the box: working, or why not."""
+        self.lookup_state.setText(str(text or ""))
+        colour = {"faint": theme.FAINT, "warn": theme.AMBER,
+                  "busy": theme.CYAN}.get(level, theme.FAINT)
+        self.lookup_state.setStyleSheet(f"color: {colour};")
+
+    def _clear_choices(self):
+        while self._choice_row.count():
+            item = self._choice_row.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+
+    def show_listing_choice(self, options):
+        """Ask which listing a bare symbol meant.
+
+        A bare "SHOP" is the US line or Toronto, and the two are different
+        companies’ worth of different. Rather than picking one, every
+        listing that returned price history is offered.
+        """
+        self._clear_choices()
+        if not options:
+            return
+
+        label = QLabel("which listing?")
+        label.setObjectName("caption")
+        self._choice_row.addWidget(label)
+
+        for option in options:
+            ticker = option.get("ticker")
+            chip = Chip(f"{ticker} \u00b7 {venue(ticker)}")
+            bits = [t for t in (option.get("name"),
+                                option.get("currency")) if t]
+            if option.get("last_close") is not None:
+                bits.append(f"last {option['last_close']:,.2f}")
+            chip.setToolTip(" \u00b7 ".join(str(b) for b in bits))
+            chip.clicked.connect(
+                lambda _c, t=ticker: self.lookup_requested.emit(t))
+            self._choice_row.addWidget(chip)
+
+        self._choice_row.addStretch(1)
+
+    def set_recent(self, tickers):
+        """The recent-lookups chip row, kept in settings.json."""
+        while self._recent_row.count():
+            item = self._recent_row.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+
+        if not tickers:
+            return
+
+        label = QLabel("recent")
+        label.setObjectName("faint")
+        self._recent_row.addWidget(label)
+
+        for ticker in tickers:
+            chip = Chip(ticker)
+            chip.setToolTip(f"show {ticker} again")
+            chip.clicked.connect(
+                lambda _c, t=ticker: self.lookup_requested.emit(t))
+            self._recent_row.addWidget(chip)
+        self._recent_row.addStretch(1)
+
+    def remember_external(self, ticker, record):
+        """Hold a record for a ticker the scan does not have."""
+        symbol = str(ticker or "").strip().upper()
+        if symbol and isinstance(record, dict):
+            self._external[symbol] = record
+
     # ── data in ─────────────────────────────────────────────────────
     def set_scan(self, scan):
         self._scan = scan
@@ -385,18 +508,23 @@ class TickerDetail(QWidget):
 
         candidate = self._scan.by_ticker.get(symbol)
         record = self._scan.scored_by_ticker.get(symbol)
-        if candidate is None and record is None:
+        external = self._external.get(symbol)
+
+        if candidate is None and record is None and external is None:
             self._subject = symbol
             self.symbol.setText(symbol)
             self.composite.setText("")
             self.rating.setText("")
             self.source.setText("not in the current scan")
             self.message.setText(
-                f"{symbol} is not in this scan's output. The lookup box that "
-                f"scores any symbol on demand is Phase 2.")
+                f"{symbol} is not in this scan's output. Use the lookup box "
+                f"above to score it on demand.")
             self.message.show()
             self.columns.hide()
             return
+
+        if record is None and external is not None:
+            record = external
 
         self._subject = symbol
         self.message.hide()

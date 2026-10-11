@@ -42,7 +42,10 @@ from PyQt6.QtWidgets import (QHBoxLayout, QLabel, QMainWindow, QPushButton,
                              QScrollArea, QSizePolicy, QSplitter, QVBoxLayout,
                              QWidget)
 
+from . import changes as changes_module
 from . import corr as corr_module
+from . import earnings as earnings_module
+from . import health as health_module
 from . import pipeline as pipe
 from . import sizing as sizing_module
 from . import state as state_module
@@ -51,10 +54,12 @@ from .datastore import DataWatcher, Scan, describe_age
 from .paths import DataPaths, pipeline_data_dir
 from .refresh import RefreshController
 from .views.candidates import CandidatesView
+from .views.changes import ChangesView
 from .views.charts import (clusters_html, currency_split, empty, heatmap,
                            portfolio_fit, score_vs_correlation)
 from .views.holdings import HoldingsView
 from .views.panel import DropdownPanel, Message, Panel
+from .views.sectors import SectorsView
 from .views.sizing_strip import SizingStrip
 from .views.status import StatusChip
 from .views.ticker_detail import SPARK_WEEKS, TickerDetail
@@ -82,18 +87,12 @@ CALENDAR_VIEWS = (("earnings", "earnings dates"),
                   ("macro", "macro releases"))
 
 PHASE_NOTE = {
-    "changes": ("Phase 2. Compares the latest scan against the previous "
-                "snapshot in data/history/ and lists what is new, up, down "
-                "or dropped, with a short reason for each."),
     "movers": ("Phase 3. Market movers and most-active names, plus a "
                "watchlist for names the screener misses."),
     "earnings": ("Phase 3. A two-week strip with report days, covering held "
                  "names and the displayed candidates."),
     "macro": ("Phase 3. Fed and Bank of Canada decisions, jobs, CPI, PCE, "
               "GDP and retail sales, refreshed weekly by macro_refresh.py."),
-    "sectors": ("Phase 2. Groups the scored candidates by sector with an "
-                "average rating, a count and the best name, and filters the "
-                "candidates table when a sector is clicked."),
 }
 
 
@@ -111,6 +110,9 @@ class MainWindow(QMainWindow):
         self._matrix = None
         self._matrix_pending = False
         self._last_tick = None
+        self._sector_filter = None
+        self._rescore_pending = False
+        self._earnings_pending = False
 
         self.data_paths = DataPaths(pipeline_data_dir(settings.get("data_dir")))
 
@@ -210,9 +212,10 @@ class MainWindow(QMainWindow):
 
         self.candidates = CandidatesView()
         self.ratings_stack.add("candidates", self.candidates)
-        self.ratings_stack.add("changes", Message(PHASE_NOTE["changes"]))
+        self.changes = ChangesView()
+        self.ratings_stack.add("changes", self.changes)
         self.ratings_stack.add("movers", Message(PHASE_NOTE["movers"]))
-        self.holdings = HoldingsView()
+        self.holdings = HoldingsView(settings=self.settings)
         self.ratings_stack.add("holdings", self.holdings)
 
         self.ratings_panel.set_body(self.ratings_stack)
@@ -252,7 +255,8 @@ class MainWindow(QMainWindow):
         row.setHandleWidth(10)
 
         self.sector_panel = Panel("sector ratings", tag="native")
-        self.sector_panel.set_body(Message(PHASE_NOTE["sectors"]))
+        self.sectors = SectorsView()
+        self.sector_panel.set_body(self.sectors)
         self.sector_panel.setMinimumWidth(190)
         row.addWidget(self.sector_panel)
 
@@ -301,12 +305,20 @@ class MainWindow(QMainWindow):
 
         self.candidates.selected.connect(self._on_candidate_selected)
         self.candidates.selection_changed.connect(self._on_selection_changed)
-        self.candidates.sector_cleared.connect(
-            lambda: self.candidates.set_sector_filter(None))
+        self.candidates.sector_cleared.connect(lambda: self._set_sector(None))
 
         self.holdings.selected.connect(
             lambda ticker: self.detail.show_ticker(ticker,
                                                    source="selected in holdings"))
+        self.holdings.rescore_requested.connect(self._rescore_holdings)
+
+        self.changes.selected.connect(
+            lambda ticker: self.detail.show_ticker(
+                ticker, source="selected in changes"))
+
+        self.sectors.sector_clicked.connect(self._on_sector_clicked)
+
+        self.detail.lookup_requested.connect(self._on_lookup)
 
         self.detail.add_to_selection.connect(self._add_to_selection)
         self.detail.reevaluate_requested.connect(self._reevaluate)
@@ -342,9 +354,12 @@ class MainWindow(QMainWindow):
                                              self.settings.get("sizing"))
 
         self.candidates.set_scan(self.scan)
-        self.holdings.set_scan(self.scan)
         self.detail.set_scan(self.scan)
+        self.detail.set_recent(self.settings.get("recent_lookups") or [])
+        self.sectors.set_scan(self.scan)
+        self.sectors.set_active(self._sector_filter)
 
+        self._refresh_history_views()
         self._apply_sizing()
 
         if table_state:
@@ -359,6 +374,8 @@ class MainWindow(QMainWindow):
         self._refresh_fit()
 
         # Section 8: file a history snapshot when a scan produced new data.
+        # Read the previous snapshot BEFORE filing this one, or "changes since
+        # last scan" would compare the scan against a copy of itself.
         if self.scan.sized:
             state_module.take_snapshot(
                 self.scan.sized,
@@ -392,6 +409,197 @@ class MainWindow(QMainWindow):
         return ("Wake is detected in the app, so a refresh after sleep only "
                 "happens while this window is open. With it closed, the next "
                 "logon refreshes.")
+
+    # ── history-backed views ────────────────────────────────────────
+    def _refresh_history_views(self):
+        """Feed the changes table and the holdings baseline.
+
+        Both read data/history/. The previous snapshot is read before this
+        scan is filed, which is why _reload calls this ahead of
+        take_snapshot: otherwise the newest snapshot IS this scan and every
+        comparison comes back empty.
+        """
+        # The snapshot of THIS scan is skipped: the app files one for every
+        # scan it loads, so on the second draw the newest snapshot is the
+        # scan on screen and the diff would always be empty.
+        _path, previous = state_module.previous_snapshot(self.scan.generated_at)
+        self.changes.set_result(changes_module.compare(
+            self.scan.sized, previous, scored=self.scan.scored))
+
+        limits = health_module.thresholds(self.settings)
+        _path, baseline_doc = state_module.snapshot_nearest(
+            limits["lookback_days"])
+        self.holdings.set_scan(
+            self.scan,
+            history_days=state_module.history_days(),
+            baseline=health_module.baseline_from(baseline_doc))
+
+        # A cached re-score survives a restart, so the health column is not
+        # blank until someone presses the button.
+        cached = state_module.read_holdings_scored()
+        if cached:
+            self.holdings.set_rescored(cached)
+
+    # ── sector filter ───────────────────────────────────────────────
+    def _on_sector_clicked(self, sector):
+        """Clicking a sector filters; clicking it again clears (section 6)."""
+        self._set_sector(None if sector == self._sector_filter else sector)
+
+    def _set_sector(self, sector):
+        self._sector_filter = sector or None
+        self.candidates.set_sector_filter(self._sector_filter)
+        self.sectors.set_active(self._sector_filter)
+        if self._sector_filter:
+            # Section 6: switch the ratings dropdown to candidates if it is on
+            # another view, so the filter you just applied is visible.
+            self.ratings_panel.set_view("candidates")
+
+    # ── lookup ──────────────────────────────────────────────────────
+    def _on_lookup(self, symbol):
+        """A symbol typed into ticker detail, or a chip clicked.
+
+        Three outcomes, in the order they are cheap:
+          - already in the scan: show it at once, no network
+          - resolves to one listing: score it in a worker
+          - resolves to several: ask which listing was meant
+        """
+        ticker = str(symbol or "").strip().upper()
+        if not ticker:
+            return
+
+        self.settings.remember_lookup(ticker)
+        self.detail.set_recent(self.settings.get("recent_lookups") or [])
+
+        if self.scan is not None and (ticker in self.scan.by_ticker
+                                      or ticker in self.scan.scored_by_ticker):
+            age = describe_age(self.scan.age)
+            self.detail.set_lookup_state("")
+            self.detail.show_ticker(ticker,
+                                    source=f"in pipeline - scored {age}")
+            self._load_sparkline(ticker)
+            return
+
+        if not pipe.ready():
+            self.detail.set_lookup_state(
+                "looking up a new symbol needs the stocks pipeline, which "
+                "could not be imported", level="warn")
+            return
+
+        self.detail.set_lookup_state(f"resolving {ticker}...", level="busy")
+        workers.submit(workers.resolve_symbol, ticker,
+                       on_done=lambda found, t=ticker: self._on_resolved(t, found),
+                       on_failed=lambda why: self.detail.set_lookup_state(
+                           f"could not look that up: {why}", level="warn"),
+                       on_progress=lambda text: self.detail.set_lookup_state(
+                           text, level="busy"))
+
+    def _on_resolved(self, requested, found):
+        """What resolve_symbol came back with."""
+        if not found:
+            self.detail.set_lookup_state(
+                f"no listing found for {requested}. Check the symbol, or add "
+                f"the exchange suffix (.TO, .V, .CN, .NE).", level="warn")
+            return
+
+        if len(found) > 1:
+            self.detail.set_lookup_state(
+                f"{requested} matches {len(found)} listings", level="warn")
+            self.detail.show_listing_choice(found)
+            return
+
+        ticker = found[0].get("ticker") or requested
+        self.detail.set_lookup_state(f"evaluating {ticker}...", level="busy")
+        workers.submit(workers.score_ticker, ticker,
+                       on_done=lambda result, t=ticker: self._on_scored(t, result),
+                       on_failed=lambda why: self.detail.set_lookup_state(
+                           f"could not evaluate: {why}", level="warn"))
+
+    def _on_scored(self, ticker, result):
+        """A looked-up ticker, scored through the evaluator's own path."""
+        record, reason = result if isinstance(result, tuple) else (None, None)
+        if record is None:
+            self.detail.set_lookup_state(
+                f"{ticker} could not be evaluated: {reason or 'no data'}",
+                level="warn")
+            return
+
+        self.detail.set_lookup_state("")
+        self.detail.remember_external(ticker, record)
+        self.detail.show_ticker(ticker,
+                                source="looked up - evaluated just now")
+        self._load_sparkline(ticker)
+
+    # ── holdings re-score ───────────────────────────────────────────
+    def _rescore_holdings(self):
+        """Run every holding through stage 1 again, off the UI thread."""
+        if self.scan is None or self._rescore_pending:
+            return
+        holdings = self.scan.holdings
+        if not holdings:
+            return
+        if not pipe.ready():
+            self.holdings.footer.setText(
+                "re-scoring needs the stocks pipeline, which could not be "
+                "imported")
+            return
+
+        self._rescore_pending = True
+        self.holdings.rescore_chip.setEnabled(False)
+        self.holdings.footer.setText(
+            f"re-scoring {len(holdings)} holding(s)...")
+
+        tickers = [h.get("ticker") for h in holdings if h.get("ticker")]
+
+        def _score_all(progress=None):
+            records = {}
+            for index, ticker in enumerate(tickers, start=1):
+                if progress:
+                    progress(f"re-scoring {ticker} "
+                             f"({index} of {len(tickers)})...")
+                record, _reason = workers.score_ticker(ticker,
+                                                       force_refresh=True)
+                if record:
+                    records[ticker] = record
+            return records
+
+        workers.submit(_score_all,
+                       on_done=self._on_rescored,
+                       on_failed=self._on_rescore_failed,
+                       on_progress=lambda text:
+                           self.holdings.footer.setText(text))
+
+        self._fetch_earnings(tickers)
+
+    def _on_rescored(self, records):
+        self._rescore_pending = False
+        self.holdings.rescore_chip.setEnabled(True)
+        if records:
+            state_module.write_holdings_scored(records)
+            self.holdings.set_rescored(records)
+        else:
+            self.holdings.footer.setText(
+                "no holding could be re-scored - check the network")
+
+    def _on_rescore_failed(self, reason):
+        self._rescore_pending = False
+        self.holdings.rescore_chip.setEnabled(True)
+        self.holdings.footer.setText(f"re-score failed: {reason}")
+
+    def _fetch_earnings(self, tickers):
+        """Next report dates for the holdings, cached and fail-soft."""
+        if self._earnings_pending or not tickers or not pipe.ready():
+            return
+        self._earnings_pending = True
+
+        def _done(dates):
+            self._earnings_pending = False
+            self.holdings.set_earnings(dates)
+
+        def _failed(_reason):
+            self._earnings_pending = False
+
+        workers.submit(earnings_module.next_reports, tickers,
+                       on_done=_done, on_failed=_failed)
 
     # ── sizing ──────────────────────────────────────────────────────
     def _apply_sizing(self):

@@ -29,6 +29,11 @@ HOLDINGS = [
      "entry_date": "2025-04-02", "entry_price":  80.10},
     {"ticker": "AAPL",   "shares":  40, "cost_basis": 171.50, "currency": "USD",
      "entry_date": "2024-11-18", "entry_price": 168.90},
+    # Deliberately NOT in NAMES below: a holding the scan does not cover, so
+    # the health view has a real "no data" row. A name can leave the universe
+    # (market cap, volume) while you still own it.
+    {"ticker": "ENB.TO",  "shares": 300, "cost_basis":  49.80, "currency": "CAD",
+     "entry_date": "2025-06-09", "entry_price":  48.15},
 ]
 
 # (ticker, name, sector, currency, composite, held, divergence, liq_flag, roa_trend)
@@ -46,6 +51,7 @@ NAMES = [
     ("XYZ.V",  "Junior Venture Co",       "Basic Materials",    "CAD", 4.80, False, "trend_confirms_decline",  True,  "deteriorating"),
     ("AAPL",   "Apple Inc.",              "Technology",         "USD", 7.35, True,  "neutral",                 False, "flat"),
     ("RY.TO",  "Royal Bank of Canada",    "Financial Services", "CAD", 7.80, True,  "neutral",                 False, "improving"),
+    ("TD.TO",  "Toronto-Dominion Bank",   "Financial Services", "CAD", 5.95, True,  "trend_confirms_decline",  False, "deteriorating"),
 ]
 
 DIMS = ("Valuation", "Profitability", "Growth", "Health", "Momentum", "Frameworks")
